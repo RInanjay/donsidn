@@ -9,8 +9,11 @@
  */
 
 const express = require("express");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 const crypto = require("crypto");
+const fs = require("fs");
 
 const PORT = process.env.PORT || 3000;
 const STREAM_KEY = process.env.SAWERIA_STREAM_KEY;
@@ -72,20 +75,76 @@ let browser = null;
 let stopped = false;
 let isConnected = false;
 let lastError = null;
+let blockCount = 0;
+let lastHeartbeatAt = 0;
+let retryTimer = null;
+
+const CHROME_DATA_DIR = process.env.CHROME_DATA_DIR || "/tmp/chrome-data";
+const challengeRe =
+  /you have been blocked|attention required|just a moment|performing security verification|verify you are human|checking your browser/i;
+
+// Satu-satunya pintu buat retry: ada backoff kalau kena blokir (60s, 2m, 4m ... maks 15m),
+// biar nggak "ngetuk pintu" Cloudflare terus-terusan yang malah bikin IP makin dicurigai.
+function scheduleRetry(blocked) {
+  if (stopped || retryTimer) return;
+  let delay = 15000;
+  if (blocked) {
+    delay = Math.min(60000 * 2 ** blockCount, 15 * 60000);
+    blockCount++;
+  }
+  console.log(`[SAWERIA] Coba lagi dalam ${Math.round(delay / 1000)} detik...`);
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    launchAndWatch();
+  }, delay);
+}
+
+async function closeBrowser() {
+  if (!browser) return;
+  const b = browser;
+  browser = null;
+  b.removeAllListeners("disconnected");
+  try {
+    await b.close();
+  } catch {}
+}
+
+// Watchdog: kalau halaman mandek (heartbeat nggak datang >2 menit), restart browser
+setInterval(() => {
+  if (isConnected && lastHeartbeatAt && Date.now() - lastHeartbeatAt > 120000) {
+    console.log("[WATCHDOG] Heartbeat berhenti >2 menit, restart browser...");
+    isConnected = false;
+    lastError = "Watchdog: halaman mandek";
+    closeBrowser().then(() => scheduleRetry(false));
+  }
+}, 60000);
 
 async function launchAndWatch() {
   if (stopped) return;
 
   try {
+    // Profil Chrome disimpan, jadi cookie cf_clearance kepakai lagi kalau browser restart
+    for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+      try {
+        fs.rmSync(`${CHROME_DATA_DIR}/${f}`, { force: true });
+      } catch {}
+    }
+
     const launchOpts = {
       headless: "new",
+      userDataDir: CHROME_DATA_DIR,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--window-size=1280,720",
       ],
     };
+    // Opsional: proxy (set PROXY_URL=http://host:port di Railway Variables)
+    if (process.env.PROXY_URL) {
+      launchOpts.args.push(`--proxy-server=${process.env.PROXY_URL}`);
+    }
     if (process.env.PUPPETEER_EXECUTABLE_PATH) {
       launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
     }
@@ -93,9 +152,28 @@ async function launchAndWatch() {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
 
+    // Proxy dengan login (opsional): PROXY_USER & PROXY_PASS
+    if (process.env.PROXY_USER) {
+      await page.authenticate({
+        username: process.env.PROXY_USER,
+        password: process.env.PROXY_PASS || "",
+      });
+    }
+
+    // Hilangkan jejak "HeadlessChrome" di User-Agent
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    );
+    await page.setViewport({ width: 1280, height: 720 });
+
     // === CCTV: semua console.log & error DI DALAM browser di-forward ke log Railway ===
+    // Halaman Saweria punya script anti-DevTools yang spam console, jadi
+    // cuma teruskan log kita sendiri (diawali "[PAGE]") dan error asli.
     page.on("console", (msg) => {
-      console.log(`[PAGE CONSOLE:${msg.type()}]`, msg.text());
+      const text = msg.text();
+      if (text.startsWith("[PAGE]") || text.startsWith("[HEARTBEAT ERROR]")) {
+        console.log(`[PAGE CONSOLE:${msg.type()}]`, text);
+      }
     });
     page.on("pageerror", (err) => {
       console.log("[PAGE ERROR]", err.message);
@@ -109,7 +187,15 @@ async function launchAndWatch() {
     });
 
     await page.exposeFunction("__onHeartbeat", (snippet) => {
+      lastHeartbeatAt = Date.now();
       console.log("[HEARTBEAT] Isi halaman saat ini:", JSON.stringify(snippet));
+      // Challenge muncul di tengah sesi -> tandai putus & restart dengan backoff
+      if (!snippet.startsWith("[CHANGE]") && challengeRe.test(snippet) && isConnected) {
+        console.log("[SAWERIA] Challenge Cloudflare muncul di tengah sesi, restart browser...");
+        isConnected = false;
+        lastError = "Diblokir Cloudflare (muncul saat sesi berjalan)";
+        closeBrowser().then(() => scheduleRetry(true));
+      }
     });
 
     const url = `https://saweria.co/widgets/alert?streamKey=${encodeURIComponent(
@@ -117,13 +203,37 @@ async function launchAndWatch() {
     )}`;
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
+    // Deteksi & tunggu challenge Cloudflare (maks ~30 detik), jangan pura-pura "connected"
+    const getText = () =>
+      page
+        .evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").slice(0, 400))
+        .catch(() => "");
+    let firstText = await getText();
+    for (let i = 0; i < 15 && challengeRe.test(firstText); i++) {
+      if (/you have been blocked/i.test(firstText)) break; // blokir keras, nunggu percuma
+      await new Promise((r) => setTimeout(r, 2000));
+      firstText = await getText();
+    }
+    // challenge lolos biasanya bikin halaman reload, kasih jeda lalu cek ulang
+    await new Promise((r) => setTimeout(r, 3000));
+    firstText = await getText();
+    if (challengeRe.test(firstText)) {
+      throw new Error("Diblokir Cloudflare (challenge nggak lolos): " + firstText.slice(0, 80));
+    }
+
     await page.evaluate(() => {
       try {
         let lastReported = "";
         let scanTimer = null;
 
+        let lastText = "";
         function scanPage() {
           const text = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+          // DEBUG: tiap teks halaman berubah, kirim ke log supaya kelihatan format alert aslinya
+          if (text && text !== lastText) {
+            lastText = text;
+            window.__onHeartbeat("[CHANGE] " + text.slice(0, 300));
+          }
           const match = text.match(/(.+?baru saja memberikan\s+Rp\s*[\d.,]+.*)/i);
           const candidate = match ? match[1] : null;
           if (candidate && candidate !== lastReported) {
@@ -168,23 +278,21 @@ async function launchAndWatch() {
     console.log("[SAWERIA] Berhasil terhubung ke widget alert, mantengin donasi...");
     isConnected = true;
     lastError = null;
+    blockCount = 0;
+    lastHeartbeatAt = Date.now();
 
     browser.on("disconnected", () => {
       if (stopped) return;
       isConnected = false;
-      console.log("[SAWERIA] Browser terputus, reconnect dalam 15 detik...");
-      setTimeout(launchAndWatch, 15000);
+      console.log("[SAWERIA] Browser terputus.");
+      scheduleRetry(false);
     });
   } catch (e) {
     console.error("[SAWERIA ERROR]", e.message);
     isConnected = false;
     lastError = e.message;
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
-    setTimeout(launchAndWatch, 15000);
+    await closeBrowser();
+    scheduleRetry(/Diblokir Cloudflare/.test(e.message));
   }
 }
 
@@ -203,6 +311,9 @@ app.get("/status", (req, res) => {
   res.json({
     connected: isConnected,
     lastError: lastError,
+    blockCount,
+    lastHeartbeatAgoSec: lastHeartbeatAt ? Math.round((Date.now() - lastHeartbeatAt) / 1000) : null,
+    uptimeSec: Math.round(process.uptime()),
   });
 });
 
