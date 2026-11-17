@@ -68,6 +68,7 @@ function addDonation(rawText) {
   donations.push(record);
   if (donations.length > MAX_STORED) donations.shift();
 
+  lastDonationAt = now;
   console.log(`[DONASI MASUK] ${record.nama} - Rp${record.nominal} - ${record.pesan}`);
 }
 
@@ -78,6 +79,17 @@ let lastError = null;
 let blockCount = 0;
 let lastHeartbeatAt = 0;
 let retryTimer = null;
+let widgetLoaded = false; // true kalau widget sudah render (bukan stuck "Loading...")
+let backendStatus = null; // status terakhir dari backend.saweria.co (angka HTTP atau pesan error)
+let backendOk = false; // pernah dapat balasan sukses dari backend.saweria.co di sesi ini
+let backendFailures = 0;
+let loadingStreak = 0;
+let lastDonationAt = null;
+let lastSnippet = "";
+let connectedSince = null;
+
+const loadingRe = /^\s*loading(\.{1,3})?\s*$/i;
+const redact = (u) => String(u).replace(/(stream_?key=)[^&\s]+/gi, "$1***");
 
 const CHROME_DATA_DIR = process.env.CHROME_DATA_DIR || "/tmp/chrome-data";
 const challengeRe =
@@ -149,6 +161,13 @@ async function launchAndWatch() {
       launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
     }
 
+    widgetLoaded = false;
+    backendStatus = null;
+    backendOk = false;
+    backendFailures = 0;
+    loadingStreak = 0;
+    connectedSince = null;
+
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
 
@@ -177,7 +196,24 @@ async function launchAndWatch() {
       console.log("[PAGE ERROR]", err.message);
     });
     page.on("requestfailed", (req) => {
-      console.log("[PAGE REQUEST FAILED]", req.url(), req.failure()?.errorText);
+      const err = req.failure()?.errorText;
+      console.log("[PAGE REQUEST FAILED]", redact(req.url()), err);
+      if (req.url().includes("backend.saweria.co")) {
+        backendFailures++;
+        backendStatus = err || "request failed";
+      }
+    });
+    // Pantau balasan dari backend.saweria.co: ini kunci supaya tahu widget beneran bisa ambil data
+    page.on("response", (res) => {
+      const u = res.url();
+      if (!u.includes("backend.saweria.co")) return;
+      backendStatus = res.status();
+      if (res.status() >= 400) {
+        backendFailures++;
+        console.log(`[BACKEND] HTTP ${res.status()} <- ${redact(u)}`);
+      } else {
+        backendOk = true;
+      }
     });
 
     await page.exposeFunction("__onSaweriaAlert", (text) => {
@@ -186,7 +222,21 @@ async function launchAndWatch() {
 
     await page.exposeFunction("__onHeartbeat", (snippet) => {
       lastHeartbeatAt = Date.now();
+      const plain = snippet.replace(/^\[CHANGE\]\s*/, "");
+      lastSnippet = plain.slice(0, 120);
+      widgetLoaded = !loadingRe.test(plain);
       console.log("[HEARTBEAT] Isi halaman saat ini:", JSON.stringify(snippet));
+      // Widget nyangkut di "Loading..." terus (3 heartbeat berturut-turut = ~60 detik) -> restart
+      if (!snippet.startsWith("[CHANGE]")) {
+        loadingStreak = widgetLoaded ? 0 : loadingStreak + 1;
+        if (loadingStreak >= 3 && isConnected) {
+          console.log("[SAWERIA] Widget macet di Loading..., restart browser...");
+          isConnected = false;
+          lastError = `Widget macet di Loading... (backend.saweria.co: ${backendStatus ?? "tidak ada respon"})`;
+          closeBrowser().then(() => scheduleRetry(true));
+          return;
+        }
+      }
       // Challenge muncul di tengah sesi -> tandai putus & restart dengan backoff
       if (!snippet.startsWith("[CHANGE]") && challengeRe.test(snippet) && isConnected) {
         console.log("[SAWERIA] Challenge Cloudflare muncul di tengah sesi, restart browser...");
@@ -218,6 +268,17 @@ async function launchAndWatch() {
     firstText = await getText();
     if (challengeRe.test(firstText)) {
       throw new Error("Diblokir Cloudflare (challenge nggak lolos): " + firstText.slice(0, 80));
+    }
+
+    // Pastikan widget BENERAN termuat (bukan nyangkut "Loading..."), baru dianggap tersambung
+    for (let i = 0; i < 15 && loadingRe.test(firstText); i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      firstText = await getText();
+    }
+    if (loadingRe.test(firstText) || (backendFailures > 0 && !backendOk)) {
+      throw new Error(
+        `Widget macet di Loading... (backend.saweria.co: ${backendStatus ?? "tidak ada respon"}) - kemungkinan IP Railway diblokir, coba pakai proxy`
+      );
     }
 
     await page.evaluate(() => {
@@ -276,6 +337,8 @@ async function launchAndWatch() {
 
     console.log("[SAWERIA] Berhasil terhubung ke widget alert, mantengin donasi...");
     isConnected = true;
+    widgetLoaded = true;
+    connectedSince = Date.now();
     lastError = null;
     blockCount = 0;
     lastHeartbeatAt = Date.now();
@@ -291,7 +354,7 @@ async function launchAndWatch() {
     isConnected = false;
     lastError = e.message;
     await closeBrowser();
-    scheduleRetry(/Diblokir Cloudflare/.test(e.message));
+    scheduleRetry(/Diblokir Cloudflare|Widget macet/.test(e.message));
   }
 }
 
@@ -318,13 +381,34 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, uptime: process.uptime(), totalDonations: donations.length });
 });
 
-// Cek apakah listener-nya berhasil connect ke widget Saweria atau nggak
+// Cek apakah listener-nya beneran tersambung ke widget Saweria
+// Buka: https://<domain-railway>/status?key=<API_KEY>
 app.get("/status", (req, res) => {
+  const tersambung = isConnected && widgetLoaded;
+  let ringkasan;
+  if (tersambung) {
+    ringkasan = "TERSAMBUNG: widget alert Saweria aktif dan siap menerima donasi.";
+  } else if (lastError) {
+    ringkasan = "TIDAK TERSAMBUNG: " + lastError;
+  } else {
+    ringkasan = "TIDAK TERSAMBUNG: masih mencoba menyambung...";
+  }
   res.json({
+    tersambung,
+    ringkasan,
     connected: isConnected,
-    lastError: lastError,
+    widgetLoaded,
+    backendSaweria: backendStatus,
+    backendFailures,
+    lastError,
     blockCount,
+    nextRetry: retryTimer ? "terjadwal" : null,
+    proxyDipakai: !!process.env.PROXY_URL,
+    isiHalaman: lastSnippet,
+    tersambungSejakDetik: connectedSince ? Math.round((Date.now() - connectedSince) / 1000) : null,
     lastHeartbeatAgoSec: lastHeartbeatAt ? Math.round((Date.now() - lastHeartbeatAt) / 1000) : null,
+    totalDonasi: donations.length,
+    donasiTerakhir: lastDonationAt ? new Date(lastDonationAt).toISOString() : null,
     uptimeSec: Math.round(process.uptime()),
   });
 });
