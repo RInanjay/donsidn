@@ -160,10 +160,8 @@ async function launchAndWatch() {
       });
     }
 
-    // Hilangkan jejak "HeadlessChrome" di User-Agent
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    );
+    // User-Agent sengaja TIDAK dipalsukan: plugin stealth sudah menyamarkan "HeadlessChrome",
+    // dan UA palsu yang beda versi/OS dari browser asli malah jadi sidik jari mencurigakan.
     await page.setViewport({ width: 1280, height: 720 });
 
     // === CCTV: semua console.log & error DI DALAM browser di-forward ke log Railway ===
@@ -201,7 +199,8 @@ async function launchAndWatch() {
     const url = `https://saweria.co/widgets/alert?streamKey=${encodeURIComponent(
       STREAM_KEY
     )}`;
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await new Promise((r) => setTimeout(r, 3000)); // kasih waktu halaman/challenge selesai render
 
     // Deteksi & tunggu challenge Cloudflare (maks ~30 detik), jangan pura-pura "connected"
     const getText = () =>
@@ -302,6 +301,19 @@ launchAndWatch();
 
 const app = express();
 
+// Proteksi API: set API_KEY di Railway Variables, lalu bot WA kirim header "x-api-key: <API_KEY>"
+// (atau query ?key=<API_KEY>). /health tetap publik buat healthcheck Railway.
+const API_KEY = process.env.API_KEY;
+if (!API_KEY) {
+  console.warn("[API] PERINGATAN: API_KEY belum diisi, /donations & /status terbuka untuk publik!");
+}
+app.use((req, res, next) => {
+  if (!API_KEY || req.path === "/health") return next();
+  const given = req.get("x-api-key") || req.query.key;
+  if (given !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  next();
+});
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, uptime: process.uptime(), totalDonations: donations.length });
 });
@@ -319,7 +331,7 @@ app.get("/status", (req, res) => {
 
 // Bot WA polling endpoint ini tiap beberapa detik.
 // Query param "since" = timestamp (ms) terakhir kali dia cek, biar cuma dapet yang baru.
-// CATATAN: endpoint ini publik, siapapun yang tau URL-nya bisa akses.
+// Dilindungi API_KEY (lihat middleware di atas).
 app.get("/donations", (req, res) => {
   const since = Number(req.query.since) || 0;
   const newOnes = donations.filter((d) => d.ts > since);
